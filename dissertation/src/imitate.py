@@ -10,7 +10,7 @@ import os
 import mediapipe as mp
 
 class MiRoClient:
-    TICK = 0.02  # Update interval for the control loop
+    TICK = 0.5  # Update interval for the control loop
     FRAME_WIDTH = 640
     FRAME_HEIGHT = 480
     YAW_LIMIT = 0.5  # Yaw limit in radians
@@ -30,7 +30,6 @@ class MiRoClient:
             tcp_nodelay=True,
         )
 
-        # Publisher for the head yaw and pitch pose
         self.head_yaw_pub = rospy.Publisher(
             topic_base_name + "/control/head_yaw/pos", Float64, queue_size=0
         )
@@ -52,7 +51,7 @@ class MiRoClient:
         ], dtype="double")
         self.dist_coeffs = np.zeros((4, 1))
 
-        # 3D model points (for face alignment)
+        # 3D model points for pose estimation
         self.model_points = np.array([
             (0.0, 0.0, 0.0),          # Nose tip
             (0.0, -63.6, -12.5),      # Chin
@@ -61,7 +60,6 @@ class MiRoClient:
             (-28.9, -28.9, -24.1),    # Left mouth corner
             (28.9, -28.9, -24.1)      # Right mouth corner
         ])
-
         self.landmark_indices = [1, 152, 33, 263, 61, 291]
 
     def callback_cam(self, ros_image):
@@ -73,7 +71,7 @@ class MiRoClient:
             rospy.logerr("Error in converting image: %s", str(e))
 
     def mimic_face(self):
-        print("MiRo is mimicking face movements. Press CTRL+C to stop.")
+        print("MiRo is mimicking head movements and centering face. Press CTRL+C to stop.")
         while not rospy.is_shutdown():
             if self.new_frame:
                 self.new_frame = False
@@ -82,6 +80,8 @@ class MiRoClient:
 
                 if results.multi_face_landmarks:
                     face_landmarks = results.multi_face_landmarks[0]
+
+                    # ----- Pose Estimation Using solvePnP -----
                     image_points = []
                     for idx in self.landmark_indices:
                         lm = face_landmarks.landmark[idx]
@@ -96,48 +96,60 @@ class MiRoClient:
                     )
 
                     if success:
-                        # Print rotation and translation for debugging
-                        print(f"Rotation Vector: {rotation_vector}")
-                        print(f"Translation Vector: {translation_vector}")
-
                         rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
 
-                        # Calculate yaw (left-right movement)
-                        yaw = np.degrees(np.arctan2(-rotation_matrix[2, 0], np.sqrt(rotation_matrix[0, 0] ** 2 + rotation_matrix[1, 0] ** 2)))
+                        # Calculate yaw and pitch from rotation matrix
+                        yaw = np.degrees(np.arctan2(-rotation_matrix[2, 0],
+                                                    np.sqrt(rotation_matrix[0, 0] ** 2 + rotation_matrix[1, 0] ** 2)))
+                        pitch = np.degrees(np.arctan2(rotation_matrix[0, 2],
+                                                      rotation_matrix[2, 2]))
 
-                        # Calculate pitch (up-down movement)
-                        pitch = np.degrees(np.arctan2(rotation_matrix[0, 2], rotation_matrix[2, 2]))
+                        yaw_radians = np.radians(yaw)
+                        pitch_radians = np.radians(pitch)
 
-                        # Clamp yaw and pitch to the allowed limits
-                        yaw_radians = np.clip(np.radians(yaw), -self.YAW_LIMIT, self.YAW_LIMIT)
-                        pitch_radians = np.clip(np.radians(pitch), -self.PITCH_LIMIT, self.PITCH_LIMIT)
+                        # ----- Face Centering Based on Nose Tip -----
+                        nose_tip = face_landmarks.landmark[1]
+                        x = int(nose_tip.x * self.FRAME_WIDTH)
+                        y = int(nose_tip.y * self.FRAME_HEIGHT)
 
-                        # Print yaw and pitch values for debugging
-                        print(f"Detected Head Yaw: {yaw_radians}")
-                        print(f"Detected Head Pitch: {pitch_radians}")
+                        dx = x - self.FRAME_WIDTH // 2
+                        dy = y - self.FRAME_HEIGHT // 2
 
-                        # Publish the head yaw and pitch to MiRo
-                        self.head_yaw_pub.publish(Float64(yaw_radians))
-                        self.head_pitch_pub.publish(Float64(pitch_radians))
+                        norm_dx = dx / (self.FRAME_WIDTH / 2)
+                        norm_dy = dy / (self.FRAME_HEIGHT / 2)
 
-                # Show the camera feed with landmarks (optional)
-                if results.multi_face_landmarks:
-                    for face_landmarks in results.multi_face_landmarks:
-                        for landmark in face_landmarks.landmark:
-                            h, w, _ = frame.shape
-                            x, y = int(landmark.x * w), int(landmark.y * h)
-                            cv2.circle(frame, (x, y), 1, (0, 255, 0), -1)
+                        correction_yaw = -norm_dx * 0.1  # small correction factor
+                        correction_pitch = -norm_dy * 0.1
 
-                # Display the image feed
+                        # Combine pose estimation and centering correction
+                        combined_yaw = np.clip(yaw_radians + correction_yaw, -self.YAW_LIMIT, self.YAW_LIMIT)
+                        combined_pitch = np.clip(pitch_radians + correction_pitch, -self.PITCH_LIMIT, self.PITCH_LIMIT)
+
+                        # Debug
+                        print(f"[Mimic] Yaw: {yaw_radians:.2f}, Pitch: {pitch_radians:.2f}")
+                        print(f"[Centering] dx: {dx}, dy: {dy}, Correction: yaw {correction_yaw:.2f}, pitch {correction_pitch:.2f}")
+                        print(f"[Combined] Final Yaw: {combined_yaw:.2f}, Final Pitch: {combined_pitch:.2f}")
+
+                        # Publish to MiRo
+                        self.head_yaw_pub.publish(Float64(combined_yaw))
+                        self.head_pitch_pub.publish(Float64(combined_pitch))
+
+                    # Draw landmarks for visualization
+                    for landmark in face_landmarks.landmark:
+                        h, w, _ = frame.shape
+                        cx, cy = int(landmark.x * w), int(landmark.y * h)
+                        cv2.circle(frame, (cx, cy), 1, (0, 255, 0), -1)
+
+                # Display the image
                 cv2.imshow("MiRo Camera Feed", cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
 
-            # Check if 'q' is pressed to close the window
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
             rospy.sleep(self.TICK)
 
         cv2.destroyAllWindows()
+        self.face_mesh.close()
 
 if __name__ == "__main__":
     node = MiRoClient()
