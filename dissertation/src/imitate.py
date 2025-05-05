@@ -2,10 +2,10 @@
 
 import os
 import time
+import random
 import rospy
 import cv2
 import numpy as np
-import random
 
 from sensor_msgs.msg import CompressedImage, JointState
 from std_msgs.msg import UInt32MultiArray
@@ -20,13 +20,14 @@ class ImitateHeadPose:
     DEBUG = False
     FRAME_WIDTH = 320
     FRAME_HEIGHT = 240
-    TICK = 0.15  # Increased for performance
+    TICK = 0.3  # Increased for performance
 
     def __init__(self):
         rospy.init_node("imitate_head_pose", anonymous=True)
         rospy.sleep(1.0)
 
         self.bridge = CvBridge()
+
         topic_base = "/" + os.getenv("MIRO_ROBOT_NAME")
 
         self.sub_cam = rospy.Subscriber(
@@ -68,17 +69,16 @@ class ImitateHeadPose:
         self.prev_pitch = 0.0
         self.prev_turn = 0.0
 
+        self.pose_lock_threshold = 0.05
+        self.success_counter_stage1 = 0
+        self.success_counter_stage2 = 0
         self.stage_mode = 1
-        self.stage1_success_counter = 0
-        self.stage2_success_counter = 0
-        self.pose_tolerance = 0.07
-        self.stage2_total_poses = 10
-
-        self.pose_locked = False
+        self.face_last_seen = time.time()
 
     def callback_cam(self, ros_image):
         try:
             image = self.bridge.compressed_imgmsg_to_cv2(ros_image, "rgb8")
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             image = cv2.resize(image, (self.FRAME_WIDTH, self.FRAME_HEIGHT))
             self.input_camera = image
             self.new_frame = True
@@ -91,6 +91,7 @@ class ImitateHeadPose:
         results = self.face_mesh.process(frame)
 
         if results.multi_face_landmarks:
+            self.face_last_seen = time.time()
             face = results.multi_face_landmarks[0]
             landmarks = face.landmark
 
@@ -127,8 +128,8 @@ class ImitateHeadPose:
         delta_turn = 0.0
 
         if abs(error_x) > deadzone:
-            turn_speed = -float(error_x) / center_x * 0.4
-            delta_turn = np.clip(turn_speed, -0.6, 0.6)
+            turn_speed = -float(error_x) / center_x * 0.2
+            delta_turn = np.clip(turn_speed, -0.3, 0.3)
             twist.twist.angular.z = delta_turn
 
         self.vel_pub.publish(twist)
@@ -137,27 +138,28 @@ class ImitateHeadPose:
     def expressive_feedback(self):
         led_msg = UInt32MultiArray()
         sequence = [
-            [0, 180, 0], [0, 100, 75], [0, 0, 180], [75, 0, 125], [150, 0, 50], [0, 180, 0]
+            [0, 180, 0],   # green
+            [0, 100, 75],  # teal
+            [0, 0, 180],   # blue
+            [75, 0, 125],  # purple
+            [150, 0, 50],  # pink
+            [0, 180, 0],   # back to green
         ]
         for color in sequence:
             led_msg.data = color * 6
             self.illum_pub.publish(led_msg)
-            rospy.sleep(0.05)
+            rospy.sleep(0.1)
         led_msg.data = [0, 0, 0] * 6
         self.illum_pub.publish(led_msg)
 
-    def switch_to_stage_two(self):
-        rospy.loginfo("Switching to Stage 2")
-        self.stage_mode = 2
-
-    def generate_random_pose(self):
-        yaw = random.uniform(-0.5, 0.5)
-        pitch = random.uniform(-0.2, 0.1)
-        return yaw, pitch
-
     def stage_one(self):
-        rospy.loginfo("Stage 1: User leads, MiRo imitates.")
-        while not rospy.is_shutdown() and self.stage_mode == 1:
+        rospy.loginfo("Stage 1: Mimic the user's pose")
+        while not rospy.is_shutdown():
+            if time.time() - self.face_last_seen > 10:
+                rospy.logwarn("No face detected. Switching to shutdown.")
+                self.shutdown()
+                return
+
             if self.new_frame:
                 self.new_frame = False
                 frame = self.input_camera.copy()
@@ -167,87 +169,87 @@ class ImitateHeadPose:
                     if self.initial_yaw is None:
                         self.initial_yaw = yaw
                         self.initial_pitch = pitch
+                        rospy.loginfo("Reference pose set.")
                         continue
 
                     rel_yaw = -(yaw - self.initial_yaw)
                     rel_pitch = pitch - self.initial_pitch
 
-                    yaw_error = abs(rel_yaw - self.prev_yaw)
-                    pitch_error = abs(rel_pitch - self.prev_pitch)
+                    if (
+                        abs(rel_yaw - self.prev_yaw) < self.pose_lock_threshold and
+                        abs(rel_pitch - self.prev_pitch) < self.pose_lock_threshold
+                    ):
+                        continue
 
-                    if not self.pose_locked and (yaw_error > self.pose_tolerance or pitch_error > self.pose_tolerance):
-                        self.set_move_kinematic(yaw=rel_yaw, pitch=rel_pitch)
-                        if face_x is not None:
-                            self.set_body_turn(face_x)
-                        self.pose_locked = True
+                    self.set_move_kinematic(yaw=rel_yaw, pitch=rel_pitch)
+                    delta_turn = self.set_body_turn(face_x) if face_x else 0.0
 
-                    elif self.pose_locked and yaw_error < self.pose_tolerance and pitch_error < self.pose_tolerance:
-                        self.expressive_feedback()
-                        self.stage1_success_counter += 1
-                        self.pose_locked = False
+                    self.expressive_feedback()
+                    self.prev_yaw = rel_yaw
+                    self.prev_pitch = rel_pitch
+                    self.prev_turn = delta_turn
+                    self.success_counter_stage1 += 1
 
-                        if self.stage1_success_counter >= 10:
-                            self.switch_to_stage_two()
-                            return
-
-                        self.prev_yaw = rel_yaw
-                        self.prev_pitch = rel_pitch
+                    if self.success_counter_stage1 >= 10:
+                        rospy.loginfo("Switching to Stage 2")
+                        self.stage_mode = 2
+                        return
 
             rospy.sleep(self.TICK)
 
     def stage_two(self):
-        rospy.loginfo("Stage 2: MiRo leads, user imitates.")
-        while not rospy.is_shutdown() and self.stage_mode == 2 and self.stage2_success_counter < self.stage2_total_poses:
-            yaw_target, pitch_target = self.generate_random_pose()
-            self.set_move_kinematic(yaw=yaw_target, pitch=pitch_target)
-            rospy.sleep(1.0)
+        rospy.loginfo("Stage 2: User mimics MiRo's pose")
+        for _ in range(100):  # Cap loop to prevent infinite run
+            if time.time() - self.face_last_seen > 5:
+                rospy.logwarn("No face detected. Shutting down.")
+                self.shutdown()
+                return
 
-            matched = False
-            start_time = rospy.Time.now()
-            last_seen = rospy.Time.now()
-            timeout = rospy.Duration(5.0)
+            yaw = random.uniform(-0.5, 0.5)
+            pitch = random.uniform(-0.2, 0.1)
+            self.set_move_kinematic(yaw=yaw, pitch=pitch)
+            rospy.sleep(2.0)
 
-            while not matched:
-                if rospy.Time.now() - last_seen > timeout:
-                    rospy.logwarn("No face detected for 5 seconds. Shutting down.")
-                    break
-
+            success = False
+            for _ in range(10):
                 if self.new_frame:
                     self.new_frame = False
-                    frame = self.input_camera
+                    frame = self.input_camera.copy()
                     user_yaw, user_pitch, _ = self.detect_head_pose(frame)
-
-                    if user_yaw is not None and user_pitch is not None:
-                        last_seen = rospy.Time.now()
-                        user_rel_yaw = -user_yaw
-                        user_rel_pitch = user_pitch
-
-                        yaw_error = abs(user_rel_yaw - yaw_target)
-                        pitch_error = abs(user_rel_pitch - pitch_target)
-
-                        if yaw_error < self.pose_tolerance and pitch_error < self.pose_tolerance:
-                            rospy.loginfo("Pose matched!")
-                            self.expressive_feedback()
-                            self.stage2_success_counter += 1
-                            matched = True
-
+                    if user_yaw is None or user_pitch is None:
+                        continue
+                    rel_yaw = -(user_yaw - self.initial_yaw)
+                    rel_pitch = user_pitch - self.initial_pitch
+                    if (
+                        abs(rel_yaw - yaw) < self.pose_lock_threshold and
+                        abs(rel_pitch - pitch) < self.pose_lock_threshold
+                    ):
+                        success = True
+                        break
                 rospy.sleep(self.TICK)
 
-            if rospy.Time.now() - last_seen > timeout:
-                break
+            if success:
+                self.success_counter_stage2 += 1
+                self.expressive_feedback()
 
-        rospy.loginfo(f"Stage 1 successes: {self.stage1_success_counter}")
-        rospy.loginfo(f"Stage 2 successes: {self.stage2_success_counter}")
-        rospy.signal_shutdown("Session complete")
+        self.shutdown()
+
+    def shutdown(self):
+        rospy.loginfo("Shutting down. Stage 1 successes: %d, Stage 2 successes: %d",
+                      self.success_counter_stage1, self.success_counter_stage2)
+        rospy.signal_shutdown("Done")
 
     def run(self):
-        while not rospy.is_shutdown():
-            if self.stage_mode == 1:
-                self.stage_one()
-            elif self.stage_mode == 2:
-                self.stage_two()
-            else:
-                break
+        rospy.loginfo("Waiting for face to initialize reference...")
+        try:
+            while not rospy.is_shutdown():
+                if self.stage_mode == 1:
+                    self.stage_one()
+                else:
+                    self.stage_two()
+        except Exception as e:
+            rospy.logerr("Fatal error: %s", str(e))
+            self.shutdown()
 
 
 if __name__ == "__main__":
