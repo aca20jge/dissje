@@ -2,26 +2,38 @@
 
 import rospy
 import cv2
-from sensor_msgs.msg import CompressedImage
-from std_msgs.msg import Float64
-from cv_bridge import CvBridge
-import numpy as np
 import os
+import numpy as np
+from sensor_msgs.msg import CompressedImage
+from std_msgs.msg import Float64MultiArray
+from cv_bridge import CvBridge
 import mediapipe as mp
 
+
 class MiRoClient:
-    TICK = 0.5  # Update interval for the control loop
+    """
+    Script to track a face, map head pose (yaw + pitch) to MiRo's head config,
+    and send configuration commands directly to control the robot's kinematic chain.
+    """
+
+    TICK = 0.02  # Control loop frequency (50 Hz)
+    YAW_LIMIT = 1.0  # Max yaw in radians (~57 deg)
+    PITCH_LIMIT = 0.5  # Max pitch in radians (~28 deg)
     FRAME_WIDTH = 640
     FRAME_HEIGHT = 480
-    YAW_LIMIT = 0.5  # Yaw limit in radians
-    PITCH_LIMIT = 0.5  # Pitch limit in radians
+    DEBUG = True
 
     def __init__(self):
-        rospy.init_node("face_mimic", anonymous=True)
-        rospy.sleep(2.0)
-        self.image_converter = CvBridge()
+        rospy.init_node("miro_head_pose_follower", anonymous=True)
+        rospy.sleep(1.0)
 
-        topic_base_name = "/" + os.getenv("MIRO_ROBOT_NAME", "miro")
+        # Get robot name
+        robot_name = os.getenv("MIRO_ROBOT_NAME", "miro")
+        topic_base_name = "/" + robot_name
+
+        self.bridge = CvBridge()
+
+        # Camera input
         self.sub_cam = rospy.Subscriber(
             topic_base_name + "/sensors/caml/compressed",
             CompressedImage,
@@ -30,127 +42,122 @@ class MiRoClient:
             tcp_nodelay=True,
         )
 
-        self.head_yaw_pub = rospy.Publisher(
-            topic_base_name + "/control/head_yaw/pos", Float64, queue_size=0
-        )
-        self.head_pitch_pub = rospy.Publisher(
-            topic_base_name + "/control/head_pitch/pos", Float64, queue_size=0
+        # Configuration publisher
+        self.config_pub = rospy.Publisher(
+            topic_base_name + "/control/configuration/pos",
+            Float64MultiArray,
+            queue_size=0,
         )
 
         self.input_camera = None
         self.new_frame = False
 
-        # Initialize MediaPipe Face Mesh
-        self.face_mesh = mp.solutions.face_mesh.FaceMesh(static_image_mode=False, max_num_faces=1)
+        # MediaPipe face mesh
+        self.mp_face_mesh = mp.solutions.face_mesh
+        self.face_mesh = self.mp_face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
 
-        # Camera internals
-        self.camera_matrix = np.array([
-            [self.FRAME_WIDTH, 0, self.FRAME_WIDTH / 2],
-            [0, self.FRAME_WIDTH, self.FRAME_HEIGHT / 2],
-            [0, 0, 1]
-        ], dtype="double")
-        self.dist_coeffs = np.zeros((4, 1))
-
-        # 3D model points for pose estimation
-        self.model_points = np.array([
-            (0.0, 0.0, 0.0),          # Nose tip
-            (0.0, -63.6, -12.5),      # Chin
-            (-43.3, 32.7, -26.0),     # Left eye left corner
-            (43.3, 32.7, -26.0),      # Right eye right corner
-            (-28.9, -28.9, -24.1),    # Left mouth corner
-            (28.9, -28.9, -24.1)      # Right mouth corner
-        ])
-        self.landmark_indices = [1, 152, 33, 263, 61, 291]
+        print("MiRo head tracking node started. Press CTRL+C to stop.")
 
     def callback_cam(self, ros_image):
         try:
-            image = self.image_converter.compressed_imgmsg_to_cv2(ros_image, "rgb8")
+            image = self.bridge.compressed_imgmsg_to_cv2(ros_image, "bgr8")
             self.input_camera = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             self.new_frame = True
         except Exception as e:
-            rospy.logerr("Error in converting image: %s", str(e))
+            rospy.logerr("Error converting camera image: %s", str(e))
 
-    def mimic_face(self):
-        print("MiRo is mimicking head movements and centering face. Press CTRL+C to stop.")
+    def calculate_head_pose(self, landmarks, image_width, image_height):
+        """
+        Estimate head yaw and pitch from selected facial landmarks.
+        """
+        # Key points: nose tip (1), chin (152), left eye (33), right eye (263)
+        nose = landmarks[1]
+        chin = landmarks[152]
+        left_eye = landmarks[33]
+        right_eye = landmarks[263]
+
+        # Convert to pixel coordinates
+        def to_pixel_coords(pt):
+            return int(pt.x * image_width), int(pt.y * image_height)
+
+        nose_pt = to_pixel_coords(nose)
+        chin_pt = to_pixel_coords(chin)
+        left_pt = to_pixel_coords(left_eye)
+        right_pt = to_pixel_coords(right_eye)
+
+        # Calculate horizontal and vertical angles
+        dx = right_pt[0] - left_pt[0]
+        dy = chin_pt[1] - nose_pt[1]
+
+        yaw = np.arctan2(dx, image_width * 0.5)
+        pitch = -np.arctan2(dy, image_height * 0.5)
+
+        return yaw, pitch
+
+    def send_head_configuration(self, yaw, pitch):
+        """
+        Send a full head configuration: [TILT, LIFT, YAW, PITCH]
+        """
+        TILT = 0.0
+        LIFT = 0.0
+
+        yaw = float(np.clip(yaw, -self.YAW_LIMIT, self.YAW_LIMIT))
+        pitch = float(np.clip(pitch, -self.PITCH_LIMIT, self.PITCH_LIMIT))
+
+        msg = Float64MultiArray()
+        msg.data = [TILT, LIFT, yaw, pitch]
+        rospy.loginfo(f"Head config -> YAW: {yaw:.2f} rad, PITCH: {pitch:.2f} rad")
+
+        self.config_pub.publish(msg)
+
+    def follow_face(self):
+        """
+        Main loop to detect face, estimate head orientation, and update MiRo's head.
+        """
         while not rospy.is_shutdown():
             if self.new_frame:
                 self.new_frame = False
-                frame = self.input_camera
-                results = self.face_mesh.process(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                frame = self.input_camera.copy()
 
+                results = self.face_mesh.process(frame)
                 if results.multi_face_landmarks:
-                    face_landmarks = results.multi_face_landmarks[0]
-
-                    # ----- Pose Estimation Using solvePnP -----
-                    image_points = []
-                    for idx in self.landmark_indices:
-                        lm = face_landmarks.landmark[idx]
-                        x = int(lm.x * self.FRAME_WIDTH)
-                        y = int(lm.y * self.FRAME_HEIGHT)
-                        image_points.append((x, y))
-
-                    image_points = np.array(image_points, dtype="double")
-
-                    success, rotation_vector, translation_vector = cv2.solvePnP(
-                        self.model_points, image_points, self.camera_matrix, self.dist_coeffs
+                    landmarks = results.multi_face_landmarks[0].landmark
+                    yaw, pitch = self.calculate_head_pose(
+                        landmarks, self.FRAME_WIDTH, self.FRAME_HEIGHT
                     )
 
-                    if success:
-                        rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
+                    self.send_head_configuration(yaw, pitch)
 
-                        # Calculate yaw and pitch from rotation matrix
-                        yaw = np.degrees(np.arctan2(-rotation_matrix[2, 0],
-                                                    np.sqrt(rotation_matrix[0, 0] ** 2 + rotation_matrix[1, 0] ** 2)))
-                        pitch = np.degrees(np.arctan2(rotation_matrix[0, 2],
-                                                      rotation_matrix[2, 2]))
-
-                        yaw_radians = np.radians(yaw)
-                        pitch_radians = np.radians(pitch)
-
-                        # ----- Face Centering Based on Nose Tip -----
-                        nose_tip = face_landmarks.landmark[1]
-                        x = int(nose_tip.x * self.FRAME_WIDTH)
-                        y = int(nose_tip.y * self.FRAME_HEIGHT)
-
-                        dx = x - self.FRAME_WIDTH // 2
-                        dy = y - self.FRAME_HEIGHT // 2
-
-                        norm_dx = dx / (self.FRAME_WIDTH / 2)
-                        norm_dy = dy / (self.FRAME_HEIGHT / 2)
-
-                        correction_yaw = -norm_dx * 0.1  # small correction factor
-                        correction_pitch = -norm_dy * 0.1
-
-                        # Combine pose estimation and centering correction
-                        combined_yaw = np.clip(yaw_radians + correction_yaw, -self.YAW_LIMIT, self.YAW_LIMIT)
-                        combined_pitch = np.clip(pitch_radians + correction_pitch, -self.PITCH_LIMIT, self.PITCH_LIMIT)
-
-                        # Debug
-                        print(f"[Mimic] Yaw: {yaw_radians:.2f}, Pitch: {pitch_radians:.2f}")
-                        print(f"[Centering] dx: {dx}, dy: {dy}, Correction: yaw {correction_yaw:.2f}, pitch {correction_pitch:.2f}")
-                        print(f"[Combined] Final Yaw: {combined_yaw:.2f}, Final Pitch: {combined_pitch:.2f}")
-
-                        # Publish to MiRo
-                        self.head_yaw_pub.publish(Float64(combined_yaw))
-                        self.head_pitch_pub.publish(Float64(combined_pitch))
-
-                    # Draw landmarks for visualization
-                    for landmark in face_landmarks.landmark:
-                        h, w, _ = frame.shape
-                        cx, cy = int(landmark.x * w), int(landmark.y * h)
-                        cv2.circle(frame, (cx, cy), 1, (0, 255, 0), -1)
-
-                # Display the image
-                cv2.imshow("MiRo Camera Feed", cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+                    # Visual feedback
+                    if self.DEBUG:
+                        cv2.putText(
+                            frame,
+                            f"YAW: {yaw:.2f}, PITCH: {pitch:.2f}",
+                            (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            (255, 255, 0),
+                            2,
+                        )
+                        cv2.imshow("MiRo Camera - Face Tracking", cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                        cv2.waitKey(1)
+                else:
+                    rospy.loginfo("No face detected.")
 
             rospy.sleep(self.TICK)
 
         cv2.destroyAllWindows()
-        self.face_mesh.close()
+
 
 if __name__ == "__main__":
-    node = MiRoClient()
-    node.mimic_face()
+    try:
+        node = MiRoClient()
+        node.follow_face()
+    except rospy.ROSInterruptException:
+        pass
