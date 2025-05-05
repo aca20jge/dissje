@@ -19,7 +19,7 @@ class ImitateHeadPose:
     DEBUG = False
     FRAME_WIDTH = 320
     FRAME_HEIGHT = 240
-    TICK = 0.1  # Faster update rate
+    TICK = 0.3  # Faster update rate
 
     def __init__(self):
         rospy.init_node("imitate_head_pose", anonymous=True)
