@@ -74,6 +74,8 @@ class ImitateHeadPose:
         self.pose_tolerance = 0.07
         self.stage2_total_poses = 10
 
+        self.pose_locked = False
+
     def callback_cam(self, ros_image):
         try:
             image = self.bridge.compressed_imgmsg_to_cv2(ros_image, "rgb8")
@@ -171,13 +173,20 @@ class ImitateHeadPose:
                     rel_yaw = -(yaw - self.initial_yaw)
                     rel_pitch = pitch - self.initial_pitch
 
-                    if abs(rel_yaw - self.prev_yaw) > self.pose_tolerance or abs(rel_pitch - self.prev_pitch) > self.pose_tolerance:
+                    yaw_error = abs(rel_yaw - self.prev_yaw)
+                    pitch_error = abs(rel_pitch - self.prev_pitch)
+
+                    if not self.pose_locked and (yaw_error > self.pose_tolerance or pitch_error > self.pose_tolerance):
                         self.set_move_kinematic(yaw=rel_yaw, pitch=rel_pitch)
                         if face_x is not None:
                             self.set_body_turn(face_x)
 
+                        self.pose_locked = True
+
+                    elif self.pose_locked and yaw_error < self.pose_tolerance and pitch_error < self.pose_tolerance:
                         self.expressive_feedback()
                         self.stage1_success_counter += 1
+                        self.pose_locked = False
 
                         if self.stage1_success_counter >= 10:
                             self.switch_to_stage_two()
