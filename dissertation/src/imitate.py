@@ -8,6 +8,7 @@ import numpy as np
 
 from sensor_msgs.msg import CompressedImage, JointState
 from std_msgs.msg import Float32MultiArray
+from geometry_msgs.msg import TwistStamped
 from cv_bridge import CvBridge
 
 import mediapipe as mp
@@ -18,7 +19,7 @@ class ImitateHeadPose:
     DEBUG = False
     FRAME_WIDTH = 320
     FRAME_HEIGHT = 240
-    TICK = 0.02
+    TICK = 0.5
 
     def __init__(self):
         rospy.init_node("imitate_head_pose", anonymous=True)
@@ -27,6 +28,7 @@ class ImitateHeadPose:
         self.bridge = CvBridge()
 
         topic_base = "/" + os.getenv("MIRO_ROBOT_NAME")
+
         self.sub_cam = rospy.Subscriber(
             topic_base + "/sensors/caml/compressed",
             CompressedImage,
@@ -39,10 +41,17 @@ class ImitateHeadPose:
             topic_base + "/control/kinematic_joints", JointState, queue_size=0
         )
 
+        self.vel_pub = rospy.Publisher(
+            topic_base + "/control/cmd_vel", TwistStamped, queue_size=0
+        )
+
+        self.illum_pub = rospy.Publisher(
+            topic_base + "/control/illum", Float32MultiArray, queue_size=0
+        )
+
         self.input_camera = None
         self.new_frame = False
 
-        # Mediapipe setup for live video
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(
             static_image_mode=False,
@@ -54,6 +63,10 @@ class ImitateHeadPose:
 
         self.initial_yaw = None
         self.initial_pitch = None
+
+        self.prev_yaw = 0.0
+        self.prev_pitch = 0.0
+        self.prev_turn = 0.0
 
     def callback_cam(self, ros_image):
         try:
@@ -67,6 +80,7 @@ class ImitateHeadPose:
 
     def detect_head_pose(self, frame):
         yaw = pitch = None
+        face_cx = None
         results = self.face_mesh.process(frame)
 
         if results.multi_face_landmarks:
@@ -83,7 +97,9 @@ class ImitateHeadPose:
             yaw = eye_diff_x * 10.0
             pitch = (nose_tip.y - eye_center_y) * 10.0
 
-        return yaw, pitch
+            face_cx = int(nose_tip.x * self.FRAME_WIDTH)
+
+        return yaw, pitch, face_cx
 
     def set_move_kinematic(self, yaw=0.0, pitch=0.0):
         joint_cmd = JointState()
@@ -95,35 +111,69 @@ class ImitateHeadPose:
         ]
         self.kinematic_pub.publish(joint_cmd)
 
+    def set_body_turn(self, face_x):
+        center_x = self.FRAME_WIDTH // 2
+        error_x = face_x - center_x
+        deadzone = 30
+
+        twist = TwistStamped()
+        delta_turn = 0.0
+
+        if abs(error_x) > deadzone:
+            turn_speed = -float(error_x) / center_x * 0.2
+            delta_turn = np.clip(turn_speed, -0.3, 0.3)
+            twist.twist.angular.z = delta_turn
+
+        self.vel_pub.publish(twist)
+        return delta_turn
+
+    def pulse_green_leds(self):
+        led_msg = Float32MultiArray()
+        # Set all 6 body LEDs to soft green
+        led_msg.data = [0.0, 0.5, 0.0] * 6
+        self.illum_pub.publish(led_msg)
+        rospy.sleep(0.1)
+        led_msg.data = [0.0, 0.0, 0.0] * 6
+        self.illum_pub.publish(led_msg)
+        rospy.sleep(0.1)
+        self.illum_pub.publish(led_msg)  # Ensure LEDs turn off
+
     def imitate_head_pose(self):
         rospy.loginfo("Waiting for face to initialize reference...")
-
-        frame_skip = 3
-        frame_count = 0
 
         while not rospy.is_shutdown():
             if self.new_frame:
                 self.new_frame = False
-                frame_count += 1
-
-                if frame_count % frame_skip != 0:
-                    rospy.sleep(self.TICK)
-                    continue
-
                 frame = self.input_camera.copy()
-                yaw, pitch = self.detect_head_pose(frame)
+
+                yaw, pitch, face_x = self.detect_head_pose(frame)
 
                 if yaw is not None and pitch is not None:
                     if self.initial_yaw is None:
                         self.initial_yaw = yaw
                         self.initial_pitch = pitch
-                        rospy.loginfo("Face detected. Reference pose set.")
+                        rospy.loginfo("Reference pose set.")
                         continue
 
                     rel_yaw = yaw - self.initial_yaw
                     rel_pitch = pitch - self.initial_pitch
 
+                    delta_yaw = abs(rel_yaw - self.prev_yaw)
+                    delta_pitch = abs(rel_pitch - self.prev_pitch)
+
                     self.set_move_kinematic(yaw=rel_yaw, pitch=rel_pitch)
+
+                    delta_turn = 0
+                    if face_x is not None:
+                        delta_turn = abs(self.set_body_turn(face_x) - self.prev_turn)
+
+                    # If significant movement occurred, pulse LEDs
+                    if delta_yaw > 0.05 or delta_pitch > 0.05 or delta_turn > 0.05:
+                        self.pulse_green_leds()
+
+                    self.prev_yaw = rel_yaw
+                    self.prev_pitch = rel_pitch
+                    self.prev_turn = delta_turn
 
                     if self.DEBUG:
                         cv2.putText(frame, f"Yaw Δ: {rel_yaw:.2f}", (10, 30),
