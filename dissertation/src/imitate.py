@@ -19,7 +19,7 @@ class ImitateHeadPose:
     DEBUG = False
     FRAME_WIDTH = 320
     FRAME_HEIGHT = 240
-    TICK = 0.3  # Faster update rate
+    TICK = 0.1  # Faster response
 
     def __init__(self):
         rospy.init_node("imitate_head_pose", anonymous=True)
@@ -63,6 +63,11 @@ class ImitateHeadPose:
 
         self.initial_yaw = None
         self.initial_pitch = None
+
+        # Pose locking to avoid micro-movement jitter
+        self.pose_locked = False
+        self.lock_threshold = 0.05      # tolerance to consider "close enough"
+        self.unlock_threshold = 0.2     # movement required to track again
 
     def callback_cam(self, ros_image):
         try:
@@ -110,11 +115,11 @@ class ImitateHeadPose:
     def set_body_turn(self, face_x):
         center_x = self.FRAME_WIDTH // 2
         error_x = face_x - center_x
-        deadzone = 10  # Tighter deadzone
+        deadzone = 10  # Tight tolerance
 
         twist = TwistStamped()
         if abs(error_x) > deadzone:
-            turn_speed = -float(error_x) / center_x * 0.6  # Faster turn
+            turn_speed = -float(error_x) / center_x * 0.6
             twist.twist.angular.z = np.clip(turn_speed, -0.6, 0.6)
 
         self.vel_pub.publish(twist)
@@ -131,11 +136,11 @@ class ImitateHeadPose:
             [0, 180, 0],     # green again
         ]
         for color in sequence:
-            led_msg.data = color * 6  # 6 LEDs
+            led_msg.data = color * 6  # 6 RGB LEDs
             self.illum_pub.publish(led_msg)
             rospy.sleep(0.05)
 
-        led_msg.data = [0, 0, 0] * 6  # Off
+        led_msg.data = [0, 0, 0] * 6  # Turn off LEDs
         self.illum_pub.publish(led_msg)
 
     def imitate_head_pose(self):
@@ -158,10 +163,24 @@ class ImitateHeadPose:
                     rel_yaw = -(yaw - self.initial_yaw)
                     rel_pitch = pitch - self.initial_pitch
 
-                    self.set_move_kinematic(yaw=rel_yaw, pitch=rel_pitch)
+                    pose_distance = np.sqrt(rel_yaw**2 + rel_pitch**2)
 
-                    if face_x is not None:
-                        self.set_body_turn(face_x)
+                    if not self.pose_locked:
+                        if pose_distance < self.lock_threshold:
+                            self.set_move_kinematic(yaw=rel_yaw, pitch=rel_pitch)
+                            self.expressive_feedback()
+                            self.pose_locked = True
+                            rospy.loginfo("Pose locked. Awaiting new movement...")
+                        else:
+                            self.set_move_kinematic(yaw=rel_yaw, pitch=rel_pitch)
+                            if face_x is not None:
+                                self.set_body_turn(face_x)
+                    else:
+                        if pose_distance > self.unlock_threshold:
+                            rospy.loginfo("Pose unlocked.")
+                            self.initial_yaw = yaw
+                            self.initial_pitch = pitch
+                            self.pose_locked = False
 
                     if self.DEBUG:
                         cv2.putText(frame, f"Yaw Δ: {rel_yaw:.2f}", (10, 30),
