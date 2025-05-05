@@ -14,7 +14,6 @@ class MiRoClient:
     DEBUG = True
     FRAME_WIDTH = 640
     FRAME_HEIGHT = 480
-    FACE_CASCADE_PATH = "/path/to/haarcascade_frontalface_default.xml"
 
     def __init__(self):
         rospy.init_node("face_follower", anonymous=True)
@@ -38,7 +37,6 @@ class MiRoClient:
             topic_base + "/control/kinematic_joints", JointState, queue_size=0
         )
 
-        self.face_cascade = cv2.CascadeClassifier(self.FACE_CASCADE_PATH)
         self.input_camera = None
         self.new_frame = False
 
@@ -57,7 +55,7 @@ class MiRoClient:
 
     def callback_cam(self, ros_image):
         try:
-            image = self.image_converter.compressed_imgmsg_to_cv2(ros_image, "rgb8")
+            image = self.image_converter.compressed_imgmsg_to_cv2(ros_image, "bgr8")
             self.input_camera = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             self.new_frame = True
         except Exception as e:
@@ -69,26 +67,25 @@ class MiRoClient:
         results = self.face_mesh.process(frame)
 
         if results.multi_face_landmarks:
+            rospy.loginfo_once("Face detected.")
             face = results.multi_face_landmarks[0]
-            # Use basic head orientation estimation from landmarks
             landmarks = face.landmark
             nose_tip = landmarks[1]
             left_eye = landmarks[33]
             right_eye = landmarks[263]
 
-            # Calculate yaw
             eye_diff_x = right_eye.x - left_eye.x
             yaw = np.clip(eye_diff_x * 10.0, -0.9, 0.9)
 
-            # Calculate pitch
             eye_center_y = (left_eye.y + right_eye.y) / 2
             pitch = np.clip((nose_tip.y - eye_center_y) * 10.0, -0.35, 0.1)
 
-            # Estimate face center in image coords
             h, w, _ = frame.shape
             cx = int(nose_tip.x * w)
             cy = int(nose_tip.y * h)
             face_pos = (cx, cy)
+        else:
+            rospy.logwarn_once("No face detected.")
 
         return face_pos, yaw, pitch
 
@@ -127,28 +124,36 @@ class MiRoClient:
                     error_x = cx - self.FRAME_WIDTH // 2
                     error_y = cy - self.FRAME_HEIGHT // 2
 
-                    # Adjust head yaw based on horizontal error
+                    # Head adjustments
                     new_yaw = self.current_yaw + (error_x / self.FRAME_WIDTH) * 0.05
-
-                    # Adjust head lift based on vertical error
                     new_lift = self.current_lift - (error_y / self.FRAME_HEIGHT) * 0.05
-
-                    # Use estimated pitch directly
                     new_pitch = est_pitch if est_pitch is not None else self.current_pitch
-
                     self.set_head_joints(lift=new_lift, yaw=new_yaw, pitch=new_pitch)
+
+                    # Movement control
+                    forward_speed = -error_y / self.FRAME_HEIGHT * 0.2  # Tune gain
+                    angular_speed = -error_x / self.FRAME_WIDTH * 0.5   # Tune gain
+
+                    move_cmd = TwistStamped()
+                    move_cmd.twist.linear.x = np.clip(forward_speed, -0.1, 0.1)
+                    move_cmd.twist.angular.z = np.clip(angular_speed, -0.3, 0.3)
+                    self.vel_pub.publish(move_cmd)
 
                     if self.DEBUG:
                         cv2.circle(frame, (cx, cy), 5, (0, 255, 0), -1)
                         cv2.imshow("MiRo Face View", cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
                         cv2.waitKey(1)
                 else:
-                    # Slowly scan
+                    # Scan slowly
                     self.set_head_joints(yaw=self.current_yaw + 0.02)
+                    stop_cmd = TwistStamped()
+                    self.vel_pub.publish(stop_cmd)
 
             rospy.sleep(self.TICK)
 
-
 if __name__ == "__main__":
-    main = MiRoClient()
-    main.follow_face()
+    try:
+        main = MiRoClient()
+        main.follow_face()
+    except rospy.ROSInterruptException:
+        pass
