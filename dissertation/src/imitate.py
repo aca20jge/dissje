@@ -20,7 +20,7 @@ class ImitateHeadPose:
     DEBUG = False
     FRAME_WIDTH = 320
     FRAME_HEIGHT = 240
-    TICK = 0.1
+    TICK = 0.15  # Increased for performance
 
     def __init__(self):
         rospy.init_node("imitate_head_pose", anonymous=True)
@@ -79,7 +79,6 @@ class ImitateHeadPose:
     def callback_cam(self, ros_image):
         try:
             image = self.bridge.compressed_imgmsg_to_cv2(ros_image, "rgb8")
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             image = cv2.resize(image, (self.FRAME_WIDTH, self.FRAME_HEIGHT))
             self.input_camera = image
             self.new_frame = True
@@ -180,7 +179,6 @@ class ImitateHeadPose:
                         self.set_move_kinematic(yaw=rel_yaw, pitch=rel_pitch)
                         if face_x is not None:
                             self.set_body_turn(face_x)
-
                         self.pose_locked = True
 
                     elif self.pose_locked and yaw_error < self.pose_tolerance and pitch_error < self.pose_tolerance:
@@ -205,15 +203,22 @@ class ImitateHeadPose:
             rospy.sleep(1.0)
 
             matched = False
-            wait_time = rospy.Time.now() + rospy.Duration(5.0)
+            start_time = rospy.Time.now()
+            last_seen = rospy.Time.now()
+            timeout = rospy.Duration(5.0)
 
-            while rospy.Time.now() < wait_time and not matched:
+            while not matched:
+                if rospy.Time.now() - last_seen > timeout:
+                    rospy.logwarn("No face detected for 5 seconds. Shutting down.")
+                    break
+
                 if self.new_frame:
                     self.new_frame = False
                     frame = self.input_camera
                     user_yaw, user_pitch, _ = self.detect_head_pose(frame)
 
                     if user_yaw is not None and user_pitch is not None:
+                        last_seen = rospy.Time.now()
                         user_rel_yaw = -user_yaw
                         user_rel_pitch = user_pitch
 
@@ -228,7 +233,12 @@ class ImitateHeadPose:
 
                 rospy.sleep(self.TICK)
 
-        rospy.loginfo(f"Stage 2 complete: {self.stage2_success_counter} poses matched.")
+            if rospy.Time.now() - last_seen > timeout:
+                break
+
+        rospy.loginfo(f"Stage 1 successes: {self.stage1_success_counter}")
+        rospy.loginfo(f"Stage 2 successes: {self.stage2_success_counter}")
+        rospy.signal_shutdown("Session complete")
 
     def run(self):
         while not rospy.is_shutdown():
