@@ -127,16 +127,22 @@ class ImitateHeadPose:
         self.vel_pub.publish(twist)
         return delta_turn
 
-    def pulse_green_leds(self):
+    def expressive_feedback(self):
         led_msg = Float32MultiArray()
-        # Set all 6 body LEDs to soft green
-        led_msg.data = [0.0, 0.5, 0.0] * 6
-        self.illum_pub.publish(led_msg)
-        rospy.sleep(0.1)
+        sequence = [
+            [0.0, 0.7, 0.0],   # green
+            [0.0, 0.4, 0.3],   # teal
+            [0.0, 0.0, 0.7],   # blue
+            [0.3, 0.0, 0.5],   # purple
+            [0.6, 0.0, 0.2],   # pink
+            [0.0, 0.7, 0.0],   # back to green
+        ]
+        for color in sequence:
+            led_msg.data = color * 6
+            self.illum_pub.publish(led_msg)
+            rospy.sleep(0.05)
         led_msg.data = [0.0, 0.0, 0.0] * 6
         self.illum_pub.publish(led_msg)
-        rospy.sleep(0.1)
-        self.illum_pub.publish(led_msg)  # Ensure LEDs turn off
 
     def imitate_head_pose(self):
         rospy.loginfo("Waiting for face to initialize reference...")
@@ -155,7 +161,7 @@ class ImitateHeadPose:
                         rospy.loginfo("Reference pose set.")
                         continue
 
-                    rel_yaw = yaw - self.initial_yaw
+                    rel_yaw = -(yaw - self.initial_yaw)  # flipped yaw direction
                     rel_pitch = pitch - self.initial_pitch
 
                     delta_yaw = abs(rel_yaw - self.prev_yaw)
@@ -167,9 +173,8 @@ class ImitateHeadPose:
                     if face_x is not None:
                         delta_turn = abs(self.set_body_turn(face_x) - self.prev_turn)
 
-                    # If significant movement occurred, pulse LEDs
                     if delta_yaw > 0.05 or delta_pitch > 0.05 or delta_turn > 0.05:
-                        self.pulse_green_leds()
+                        self.expressive_feedback()
 
                     self.prev_yaw = rel_yaw
                     self.prev_pitch = rel_pitch
