@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 
 from sensor_msgs.msg import CompressedImage, JointState
-from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import UInt32MultiArray
 from geometry_msgs.msg import TwistStamped
 from cv_bridge import CvBridge
 
@@ -19,7 +19,7 @@ class ImitateHeadPose:
     DEBUG = False
     FRAME_WIDTH = 320
     FRAME_HEIGHT = 240
-    TICK = 0.5
+    TICK = 0.1  # Faster update rate
 
     def __init__(self):
         rospy.init_node("imitate_head_pose", anonymous=True)
@@ -46,7 +46,7 @@ class ImitateHeadPose:
         )
 
         self.illum_pub = rospy.Publisher(
-            topic_base + "/control/illum", Float32MultiArray, queue_size=0
+            topic_base + "/control/illum", UInt32MultiArray, queue_size=0
         )
 
         self.input_camera = None
@@ -63,10 +63,6 @@ class ImitateHeadPose:
 
         self.initial_yaw = None
         self.initial_pitch = None
-
-        self.prev_yaw = 0.0
-        self.prev_pitch = 0.0
-        self.prev_turn = 0.0
 
     def callback_cam(self, ros_image):
         try:
@@ -114,34 +110,32 @@ class ImitateHeadPose:
     def set_body_turn(self, face_x):
         center_x = self.FRAME_WIDTH // 2
         error_x = face_x - center_x
-        deadzone = 30
+        deadzone = 10  # Tighter deadzone
 
         twist = TwistStamped()
-        delta_turn = 0.0
-
         if abs(error_x) > deadzone:
-            turn_speed = -float(error_x) / center_x * 0.2
-            delta_turn = np.clip(turn_speed, -0.3, 0.3)
-            twist.twist.angular.z = delta_turn
+            turn_speed = -float(error_x) / center_x * 0.6  # Faster turn
+            twist.twist.angular.z = np.clip(turn_speed, -0.6, 0.6)
 
         self.vel_pub.publish(twist)
-        return delta_turn
+        return twist.twist.angular.z
 
     def expressive_feedback(self):
-        led_msg = Float32MultiArray()
+        led_msg = UInt32MultiArray()
         sequence = [
-            [0.0, 0.7, 0.0],   # green
-            [0.0, 0.4, 0.3],   # teal
-            [0.0, 0.0, 0.7],   # blue
-            [0.3, 0.0, 0.5],   # purple
-            [0.6, 0.0, 0.2],   # pink
-            [0.0, 0.7, 0.0],   # back to green
+            [0, 180, 0],     # green
+            [0, 100, 75],    # teal
+            [0, 0, 180],     # blue
+            [75, 0, 130],    # purple
+            [150, 0, 50],    # pink
+            [0, 180, 0],     # green again
         ]
         for color in sequence:
-            led_msg.data = color * 6
+            led_msg.data = color * 6  # 6 LEDs
             self.illum_pub.publish(led_msg)
             rospy.sleep(0.05)
-        led_msg.data = [0.0, 0.0, 0.0] * 6
+
+        led_msg.data = [0, 0, 0] * 6  # Off
         self.illum_pub.publish(led_msg)
 
     def imitate_head_pose(self):
@@ -150,7 +144,7 @@ class ImitateHeadPose:
         while not rospy.is_shutdown():
             if self.new_frame:
                 self.new_frame = False
-                frame = self.input_camera.copy()
+                frame = self.input_camera
 
                 yaw, pitch, face_x = self.detect_head_pose(frame)
 
@@ -161,24 +155,13 @@ class ImitateHeadPose:
                         rospy.loginfo("Reference pose set.")
                         continue
 
-                    rel_yaw = -(yaw - self.initial_yaw)  # flipped yaw direction
+                    rel_yaw = -(yaw - self.initial_yaw)
                     rel_pitch = pitch - self.initial_pitch
-
-                    delta_yaw = abs(rel_yaw - self.prev_yaw)
-                    delta_pitch = abs(rel_pitch - self.prev_pitch)
 
                     self.set_move_kinematic(yaw=rel_yaw, pitch=rel_pitch)
 
-                    delta_turn = 0
                     if face_x is not None:
-                        delta_turn = abs(self.set_body_turn(face_x) - self.prev_turn)
-
-                    if delta_yaw > 0.05 or delta_pitch > 0.05 or delta_turn > 0.05:
-                        self.expressive_feedback()
-
-                    self.prev_yaw = rel_yaw
-                    self.prev_pitch = rel_pitch
-                    self.prev_turn = delta_turn
+                        self.set_body_turn(face_x)
 
                     if self.DEBUG:
                         cv2.putText(frame, f"Yaw Δ: {rel_yaw:.2f}", (10, 30),
