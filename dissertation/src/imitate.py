@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 
 from sensor_msgs.msg import CompressedImage, JointState
-from std_msgs.msg import UInt32MultiArray
+from std_msgs.msg import UInt32MultiArray, UInt16MultiArray
 from geometry_msgs.msg import TwistStamped
 from cv_bridge import CvBridge
 
@@ -20,7 +20,7 @@ class ImitateHeadPose:
     DEBUG = False
     FRAME_WIDTH = 320
     FRAME_HEIGHT = 240
-    TICK = 0.3  # Increased for performance
+    TICK = 0.3
 
     def __init__(self):
         rospy.init_node("imitate_head_pose", anonymous=True)
@@ -48,6 +48,10 @@ class ImitateHeadPose:
 
         self.illum_pub = rospy.Publisher(
             topic_base + "/control/illum", UInt32MultiArray, queue_size=0
+        )
+
+        self.audio_pub = rospy.Publisher(
+            topic_base + "/control/audio", UInt16MultiArray, queue_size=0
         )
 
         self.input_camera = None
@@ -136,21 +140,9 @@ class ImitateHeadPose:
         return delta_turn
 
     def expressive_feedback(self):
-        led_msg = UInt32MultiArray()
-        sequence = [
-            [0, 180, 0],   # green
-            [0, 100, 75],  # teal
-            [0, 0, 180],   # blue
-            [75, 0, 125],  # purple
-            [150, 0, 50],  # pink
-            [0, 180, 0],   # back to green
-        ]
-        for color in sequence:
-            led_msg.data = color * 6
-            self.illum_pub.publish(led_msg)
-            rospy.sleep(0.1)
-        led_msg.data = [0, 0, 0] * 6
-        self.illum_pub.publish(led_msg)
+        sound_msg = UInt16MultiArray()
+        sound_msg.data = [miro.constants.SOUND_HAPPY]
+        self.audio_pub.publish(sound_msg)
 
     def stage_one(self):
         rospy.loginfo("Stage 1: Mimic the user's pose")
@@ -199,34 +191,40 @@ class ImitateHeadPose:
 
     def stage_two(self):
         rospy.loginfo("Stage 2: User mimics MiRo's pose")
-        for _ in range(100):  # Cap loop to prevent infinite run
+        for _ in range(100):
             if time.time() - self.face_last_seen > 5:
                 rospy.logwarn("No face detected. Shutting down.")
                 self.shutdown()
                 return
 
-            yaw = random.uniform(-0.5, 0.5)
-            pitch = random.uniform(-0.2, 0.1)
+            yaw = random.choice([-0.6, -0.3, 0.3, 0.6])
+            pitch = random.choice([-0.2, -0.1, 0.0, 0.1])
             self.set_move_kinematic(yaw=yaw, pitch=pitch)
             rospy.sleep(2.0)
 
             success = False
+            yaw_samples = []
+            pitch_samples = []
+
             for _ in range(10):
                 if self.new_frame:
                     self.new_frame = False
                     frame = self.input_camera.copy()
                     user_yaw, user_pitch, _ = self.detect_head_pose(frame)
-                    if user_yaw is None or user_pitch is None:
-                        continue
-                    rel_yaw = -(user_yaw - self.initial_yaw)
-                    rel_pitch = user_pitch - self.initial_pitch
-                    if (
-                        abs(rel_yaw - yaw) < self.pose_lock_threshold and
-                        abs(rel_pitch - pitch) < self.pose_lock_threshold
-                    ):
-                        success = True
-                        break
+                    if user_yaw is not None and user_pitch is not None:
+                        rel_yaw = -(user_yaw - self.initial_yaw)
+                        rel_pitch = user_pitch - self.initial_pitch
+                        yaw_samples.append(rel_yaw)
+                        pitch_samples.append(rel_pitch)
                 rospy.sleep(self.TICK)
+
+            if yaw_samples and pitch_samples:
+                avg_yaw = sum(yaw_samples) / len(yaw_samples)
+                avg_pitch = sum(pitch_samples) / len(pitch_samples)
+                yaw_error = abs(avg_yaw - yaw)
+                pitch_error = abs(avg_pitch - pitch)
+                if yaw_error < self.pose_lock_threshold * 2 and pitch_error < self.pose_lock_threshold * 2:
+                    success = True
 
             if success:
                 self.success_counter_stage2 += 1
