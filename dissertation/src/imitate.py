@@ -15,9 +15,9 @@ import miro2 as miro
 
 
 class ImitateHeadPose:
-    DEBUG = True
-    FRAME_WIDTH = 640
-    FRAME_HEIGHT = 480
+    DEBUG = False
+    FRAME_WIDTH = 320
+    FRAME_HEIGHT = 240
     TICK = 0.02
 
     def __init__(self):
@@ -42,9 +42,10 @@ class ImitateHeadPose:
         self.input_camera = None
         self.new_frame = False
 
-        # Mediapipe FaceMesh setup
+        # Mediapipe setup for live video
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(
+            static_image_mode=False,
             max_num_faces=1,
             refine_landmarks=True,
             min_detection_confidence=0.5,
@@ -57,7 +58,9 @@ class ImitateHeadPose:
     def callback_cam(self, ros_image):
         try:
             image = self.bridge.compressed_imgmsg_to_cv2(ros_image, "rgb8")
-            self.input_camera = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            image = cv2.resize(image, (self.FRAME_WIDTH, self.FRAME_HEIGHT))
+            self.input_camera = image
             self.new_frame = True
         except Exception as e:
             rospy.logerr("Image conversion failed: %s", str(e))
@@ -85,18 +88,28 @@ class ImitateHeadPose:
     def set_move_kinematic(self, yaw=0.0, pitch=0.0):
         joint_cmd = JointState()
         joint_cmd.position = [
-            miro.constants.TILT_RAD_CALIB,                     # tilt (not used)
-            miro.constants.LIFT_RAD_CALIB,                     # lift (default)
-            np.clip(yaw, -0.9, 0.9),                            # yaw
-            np.clip(pitch, -0.35, 0.1),                         # pitch
+            miro.constants.TILT_RAD_CALIB,
+            miro.constants.LIFT_RAD_CALIB,
+            np.clip(yaw, -0.9, 0.9),
+            np.clip(pitch, -0.35, 0.1),
         ]
         self.kinematic_pub.publish(joint_cmd)
 
     def imitate_head_pose(self):
-        rospy.loginfo("Waiting to detect a face to set center...")
+        rospy.loginfo("Waiting for face to initialize reference...")
+
+        frame_skip = 3
+        frame_count = 0
+
         while not rospy.is_shutdown():
             if self.new_frame:
                 self.new_frame = False
+                frame_count += 1
+
+                if frame_count % frame_skip != 0:
+                    rospy.sleep(self.TICK)
+                    continue
+
                 frame = self.input_camera.copy()
                 yaw, pitch = self.detect_head_pose(frame)
 
@@ -104,14 +117,12 @@ class ImitateHeadPose:
                     if self.initial_yaw is None:
                         self.initial_yaw = yaw
                         self.initial_pitch = pitch
-                        rospy.loginfo("Face detected. Setting head center reference.")
+                        rospy.loginfo("Face detected. Reference pose set.")
                         continue
 
-                    # Compute relative deltas
                     rel_yaw = yaw - self.initial_yaw
                     rel_pitch = pitch - self.initial_pitch
 
-                    # Apply movement
                     self.set_move_kinematic(yaw=rel_yaw, pitch=rel_pitch)
 
                     if self.DEBUG:
@@ -119,7 +130,7 @@ class ImitateHeadPose:
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                         cv2.putText(frame, f"Pitch Δ: {rel_pitch:.2f}", (10, 60),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                        cv2.imshow("MiRo Imitate View", cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                        cv2.imshow("MiRo Debug View", cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
                         cv2.waitKey(1)
 
             rospy.sleep(self.TICK)
