@@ -139,10 +139,18 @@ class ImitateHeadPose:
         self.vel_pub.publish(twist)
         return delta_turn
 
-    def expressive_feedback(self):
+def expressive_feedback(self):
+    try:
+        voice_pub = rospy.Publisher(
+            "/" + os.getenv("MIRO_ROBOT_NAME") + "/control/miro_voice",
+            UInt16MultiArray,
+            queue_size=1
+        )
         sound_msg = UInt16MultiArray()
-        sound_msg.data = [miro.constants.SOUND_HAPPY]
-        self.audio_pub.publish(sound_msg)
+        sound_msg.data = [miro.constants.SOUND_PLAY_HAPPY]
+        voice_pub.publish(sound_msg)
+    except Exception as e:
+        rospy.logwarn("Sound playback failed: %s", str(e))
 
     def stage_one(self):
         rospy.loginfo("Stage 1: Mimic the user's pose")
