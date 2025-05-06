@@ -20,7 +20,7 @@ class ImitateHeadPose:
     DEBUG = False
     FRAME_WIDTH = 320
     FRAME_HEIGHT = 240
-    TICK = 0.3
+    TICK = 0.3  # Increased for performance
 
     def __init__(self):
         rospy.init_node("imitate_head_pose", anonymous=True)
@@ -46,12 +46,8 @@ class ImitateHeadPose:
             topic_base + "/control/cmd_vel", TwistStamped, queue_size=0
         )
 
-        self.illum_pub = rospy.Publisher(
-            topic_base + "/control/illum", UInt32MultiArray, queue_size=0
-        )
-
-        self.audio_pub = rospy.Publisher(
-            topic_base + "/control/audio", UInt16MultiArray, queue_size=0
+        self.voice_pub = rospy.Publisher(
+            topic_base + "/control/miro_voice", UInt16MultiArray, queue_size=1
         )
 
         self.input_camera = None
@@ -139,18 +135,13 @@ class ImitateHeadPose:
         self.vel_pub.publish(twist)
         return delta_turn
 
-def expressive_feedback(self):
-    try:
-        voice_pub = rospy.Publisher(
-            "/" + os.getenv("MIRO_ROBOT_NAME") + "/control/miro_voice",
-            UInt16MultiArray,
-            queue_size=1
-        )
-        sound_msg = UInt16MultiArray()
-        sound_msg.data = [miro.constants.SOUND_PLAY_HAPPY]
-        voice_pub.publish(sound_msg)
-    except Exception as e:
-        rospy.logwarn("Sound playback failed: %s", str(e))
+    def expressive_feedback(self):
+        try:
+            sound_msg = UInt16MultiArray()
+            sound_msg.data = [miro.constants.SOUND_PLAY_HAPPY]
+            self.voice_pub.publish(sound_msg)
+        except Exception as e:
+            rospy.logwarn("Failed to play sound: %s", str(e))
 
     def stage_one(self):
         rospy.loginfo("Stage 1: Mimic the user's pose")
@@ -199,40 +190,34 @@ def expressive_feedback(self):
 
     def stage_two(self):
         rospy.loginfo("Stage 2: User mimics MiRo's pose")
-        for _ in range(100):
+        for _ in range(100):  # Cap loop to prevent infinite run
             if time.time() - self.face_last_seen > 5:
                 rospy.logwarn("No face detected. Shutting down.")
                 self.shutdown()
                 return
 
-            yaw = random.choice([-0.6, -0.3, 0.3, 0.6])
-            pitch = random.choice([-0.2, -0.1, 0.0, 0.1])
+            yaw = random.choice([-0.5, 0.5])
+            pitch = random.choice([-0.2, 0.1])
             self.set_move_kinematic(yaw=yaw, pitch=pitch)
-            rospy.sleep(2.0)
+            rospy.sleep(2.5)  # Slightly longer to give user time to react
 
             success = False
-            yaw_samples = []
-            pitch_samples = []
-
-            for _ in range(10):
+            for _ in range(15):
                 if self.new_frame:
                     self.new_frame = False
                     frame = self.input_camera.copy()
                     user_yaw, user_pitch, _ = self.detect_head_pose(frame)
-                    if user_yaw is not None and user_pitch is not None:
-                        rel_yaw = -(user_yaw - self.initial_yaw)
-                        rel_pitch = user_pitch - self.initial_pitch
-                        yaw_samples.append(rel_yaw)
-                        pitch_samples.append(rel_pitch)
+                    if user_yaw is None or user_pitch is None:
+                        continue
+                    rel_yaw = -(user_yaw - self.initial_yaw)
+                    rel_pitch = user_pitch - self.initial_pitch
+                    if (
+                        abs(rel_yaw - yaw) < self.pose_lock_threshold * 1.5 and
+                        abs(rel_pitch - pitch) < self.pose_lock_threshold * 1.5
+                    ):
+                        success = True
+                        break
                 rospy.sleep(self.TICK)
-
-            if yaw_samples and pitch_samples:
-                avg_yaw = sum(yaw_samples) / len(yaw_samples)
-                avg_pitch = sum(pitch_samples) / len(pitch_samples)
-                yaw_error = abs(avg_yaw - yaw)
-                pitch_error = abs(avg_pitch - pitch)
-                if yaw_error < self.pose_lock_threshold * 2 and pitch_error < self.pose_lock_threshold * 2:
-                    success = True
 
             if success:
                 self.success_counter_stage2 += 1
