@@ -8,10 +8,11 @@ import cv2
 import numpy as np
 
 from sensor_msgs.msg import CompressedImage, JointState
-from std_msgs.msg import UInt32MultiArray, UInt16MultiArray
+from std_msgs.msg import UInt32MultiArray
 from geometry_msgs.msg import TwistStamped
 from cv_bridge import CvBridge
 
+from miro_msgs.msg import Audio
 import mediapipe as mp
 import miro2 as miro
 
@@ -20,7 +21,7 @@ class ImitateHeadPose:
     DEBUG = False
     FRAME_WIDTH = 320
     FRAME_HEIGHT = 240
-    TICK = 0.3  # Increased for performance
+    TICK = 0.3  # Lower tick = more responsive, increase for performance
 
     def __init__(self):
         rospy.init_node("imitate_head_pose", anonymous=True)
@@ -46,8 +47,8 @@ class ImitateHeadPose:
             topic_base + "/control/cmd_vel", TwistStamped, queue_size=0
         )
 
-        self.voice_pub = rospy.Publisher(
-            topic_base + "/control/miro_voice", UInt16MultiArray, queue_size=1
+        self.audio_pub = rospy.Publisher(
+            topic_base + "/control/audio", Audio, queue_size=1
         )
 
         self.input_camera = None
@@ -136,15 +137,12 @@ class ImitateHeadPose:
         return delta_turn
 
     def expressive_feedback(self):
-        try:
-            sound_msg = UInt16MultiArray()
-            sound_msg.data = [miro.constants.SOUND_PLAY_HAPPY]
-            self.voice_pub.publish(sound_msg)
-        except Exception as e:
-            rospy.logwarn("Failed to play sound: %s", str(e))
+        msg = Audio()
+        msg.index = 1  # "Happy" sound ID for MiRo Dev Kit
+        self.audio_pub.publish(msg)
 
     def stage_one(self):
-        rospy.loginfo("Stage 1: Mimic the user's pose")
+        rospy.loginfo("Stage 1: MiRo mimics the user's pose")
         while not rospy.is_shutdown():
             if time.time() - self.face_last_seen > 10:
                 rospy.logwarn("No face detected. Switching to shutdown.")
@@ -190,40 +188,61 @@ class ImitateHeadPose:
 
     def stage_two(self):
         rospy.loginfo("Stage 2: User mimics MiRo's pose")
-        for _ in range(100):  # Cap loop to prevent infinite run
+        while not rospy.is_shutdown():
             if time.time() - self.face_last_seen > 5:
                 rospy.logwarn("No face detected. Shutting down.")
                 self.shutdown()
                 return
 
-            yaw = random.choice([-0.5, 0.5])
-            pitch = random.choice([-0.2, 0.1])
-            self.set_move_kinematic(yaw=yaw, pitch=pitch)
-            rospy.sleep(2.5)  # Slightly longer to give user time to react
+            # Set a new pose and wait for mimic
+            target_yaw = random.choice([-0.4, 0.4])
+            target_pitch = random.choice([-0.15, 0.1])
+            rospy.loginfo(f"Pose set: yaw={target_yaw:.2f}, pitch={target_pitch:.2f}")
+            self.set_move_kinematic(yaw=target_yaw, pitch=target_pitch)
 
-            success = False
-            for _ in range(15):
+            rospy.sleep(3.0)
+
+            mimic_success = False
+            wait_time = 0
+            max_wait = 8.0
+
+            while wait_time < max_wait:
                 if self.new_frame:
                     self.new_frame = False
                     frame = self.input_camera.copy()
                     user_yaw, user_pitch, _ = self.detect_head_pose(frame)
+
                     if user_yaw is None or user_pitch is None:
+                        wait_time += self.TICK
+                        rospy.sleep(self.TICK)
                         continue
+
                     rel_yaw = -(user_yaw - self.initial_yaw)
                     rel_pitch = user_pitch - self.initial_pitch
-                    if (
-                        abs(rel_yaw - yaw) < self.pose_lock_threshold * 1.5 and
-                        abs(rel_pitch - pitch) < self.pose_lock_threshold * 1.5
-                    ):
-                        success = True
+
+                    yaw_diff = abs(rel_yaw - target_yaw)
+                    pitch_diff = abs(rel_pitch - target_pitch)
+
+                    rospy.loginfo(f"User yaw diff: {yaw_diff:.2f}, pitch diff: {pitch_diff:.2f}")
+
+                    if yaw_diff < self.pose_lock_threshold * 2 and pitch_diff < self.pose_lock_threshold * 2:
+                        mimic_success = True
                         break
+
+                wait_time += self.TICK
                 rospy.sleep(self.TICK)
 
-            if success:
+            if mimic_success:
+                rospy.loginfo("User successfully mimicked pose!")
                 self.success_counter_stage2 += 1
                 self.expressive_feedback()
+            else:
+                rospy.loginfo("No mimic detected for this pose.")
 
-        self.shutdown()
+            if self.success_counter_stage2 >= 5:
+                rospy.loginfo("Stage 2 complete!")
+                self.shutdown()
+                return
 
     def shutdown(self):
         rospy.loginfo("Shutting down. Stage 1 successes: %d, Stage 2 successes: %d",
