@@ -12,23 +12,21 @@ from std_msgs.msg import UInt32MultiArray
 from geometry_msgs.msg import TwistStamped
 from cv_bridge import CvBridge
 
-from miro_msgs.msg import Audio
 import mediapipe as mp
 import miro2 as miro
 
 
 class ImitateHeadPose:
-    DEBUG = False
+    DEBUG = True  # Set True for OpenCV debug view
     FRAME_WIDTH = 320
     FRAME_HEIGHT = 240
-    TICK = 0.3  # Lower tick = more responsive, increase for performance
+    TICK = 0.3
 
     def __init__(self):
         rospy.init_node("imitate_head_pose", anonymous=True)
         rospy.sleep(1.0)
 
         self.bridge = CvBridge()
-
         topic_base = "/" + os.getenv("MIRO_ROBOT_NAME")
 
         self.sub_cam = rospy.Subscriber(
@@ -45,10 +43,6 @@ class ImitateHeadPose:
 
         self.vel_pub = rospy.Publisher(
             topic_base + "/control/cmd_vel", TwistStamped, queue_size=0
-        )
-
-        self.audio_pub = rospy.Publisher(
-            topic_base + "/control/audio", Audio, queue_size=1
         )
 
         self.input_camera = None
@@ -105,10 +99,20 @@ class ImitateHeadPose:
 
             yaw = eye_diff_x * 10.0
             pitch = (nose_tip.y - eye_center_y) * 10.0
-
             face_cx = int(nose_tip.x * self.FRAME_WIDTH)
 
-        return yaw, pitch, face_cx
+            if self.DEBUG:
+                for lm in [nose_tip, left_eye, right_eye]:
+                    cx = int(lm.x * self.FRAME_WIDTH)
+                    cy = int(lm.y * self.FRAME_HEIGHT)
+                    cv2.circle(frame, (cx, cy), 3, (255, 0, 0), -1)
+
+                cv2.putText(frame, f"Yaw: {yaw:.2f}", (10, 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                cv2.putText(frame, f"Pitch: {pitch:.2f}", (10, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+        return yaw, pitch, face_cx, frame
 
     def set_move_kinematic(self, yaw=0.0, pitch=0.0):
         joint_cmd = JointState()
@@ -136,11 +140,6 @@ class ImitateHeadPose:
         self.vel_pub.publish(twist)
         return delta_turn
 
-    def expressive_feedback(self):
-        msg = Audio()
-        msg.index = 1  # "Happy" sound ID for MiRo Dev Kit
-        self.audio_pub.publish(msg)
-
     def stage_one(self):
         rospy.loginfo("Stage 1: MiRo mimics the user's pose")
         while not rospy.is_shutdown():
@@ -152,7 +151,11 @@ class ImitateHeadPose:
             if self.new_frame:
                 self.new_frame = False
                 frame = self.input_camera.copy()
-                yaw, pitch, face_x = self.detect_head_pose(frame)
+                yaw, pitch, face_x, debug_frame = self.detect_head_pose(frame)
+
+                if self.DEBUG:
+                    cv2.imshow("MiRo Debug", debug_frame)
+                    cv2.waitKey(1)
 
                 if yaw is not None and pitch is not None:
                     if self.initial_yaw is None:
@@ -171,12 +174,10 @@ class ImitateHeadPose:
                         continue
 
                     self.set_move_kinematic(yaw=rel_yaw, pitch=rel_pitch)
-                    delta_turn = self.set_body_turn(face_x) if face_x else 0.0
+                    self.set_body_turn(face_x) if face_x else 0.0
 
-                    self.expressive_feedback()
                     self.prev_yaw = rel_yaw
                     self.prev_pitch = rel_pitch
-                    self.prev_turn = delta_turn
                     self.success_counter_stage1 += 1
 
                     if self.success_counter_stage1 >= 10:
@@ -194,23 +195,26 @@ class ImitateHeadPose:
                 self.shutdown()
                 return
 
-            # Set a new pose and wait for mimic
             target_yaw = random.choice([-0.4, 0.4])
             target_pitch = random.choice([-0.15, 0.1])
             rospy.loginfo(f"Pose set: yaw={target_yaw:.2f}, pitch={target_pitch:.2f}")
             self.set_move_kinematic(yaw=target_yaw, pitch=target_pitch)
 
-            rospy.sleep(3.0)
+            rospy.sleep(5.0)  # Pose hold before checking
 
             mimic_success = False
             wait_time = 0
-            max_wait = 8.0
+            max_wait = 10.0  # Allow more time for user mimic
 
             while wait_time < max_wait:
                 if self.new_frame:
                     self.new_frame = False
                     frame = self.input_camera.copy()
-                    user_yaw, user_pitch, _ = self.detect_head_pose(frame)
+                    user_yaw, user_pitch, _, debug_frame = self.detect_head_pose(frame)
+
+                    if self.DEBUG:
+                        cv2.imshow("MiRo Debug", debug_frame)
+                        cv2.waitKey(1)
 
                     if user_yaw is None or user_pitch is None:
                         wait_time += self.TICK
@@ -223,9 +227,7 @@ class ImitateHeadPose:
                     yaw_diff = abs(rel_yaw - target_yaw)
                     pitch_diff = abs(rel_pitch - target_pitch)
 
-                    rospy.loginfo(f"User yaw diff: {yaw_diff:.2f}, pitch diff: {pitch_diff:.2f}")
-
-                    if yaw_diff < self.pose_lock_threshold * 2 and pitch_diff < self.pose_lock_threshold * 2:
+                    if yaw_diff < self.pose_lock_threshold * 3 and pitch_diff < self.pose_lock_threshold * 3:
                         mimic_success = True
                         break
 
@@ -233,11 +235,10 @@ class ImitateHeadPose:
                 rospy.sleep(self.TICK)
 
             if mimic_success:
-                rospy.loginfo("User successfully mimicked pose!")
+                rospy.loginfo("User mimicked the pose!")
                 self.success_counter_stage2 += 1
-                self.expressive_feedback()
             else:
-                rospy.loginfo("No mimic detected for this pose.")
+                rospy.loginfo("User did not mimic the pose.")
 
             if self.success_counter_stage2 >= 5:
                 rospy.loginfo("Stage 2 complete!")
@@ -245,7 +246,9 @@ class ImitateHeadPose:
                 return
 
     def shutdown(self):
-        rospy.loginfo("Shutting down. Stage 1 successes: %d, Stage 2 successes: %d",
+        if self.DEBUG:
+            cv2.destroyAllWindows()
+        rospy.loginfo("Shutting down. Stage 1: %d, Stage 2: %d",
                       self.success_counter_stage1, self.success_counter_stage2)
         rospy.signal_shutdown("Done")
 
