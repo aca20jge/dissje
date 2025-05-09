@@ -224,8 +224,8 @@ class ImitateHeadPose:
                     rel_yaw = -(user_yaw - self.initial_yaw)
                     rel_pitch = user_pitch - self.initial_pitch
 
-                    yaw_diff = abs(rel_yaw - target_yaw)
-                    pitch_diff = abs(rel_pitch - target_pitch)
+                    yaw_diff = abs(rel_yaw - target_yaw) /2.5
+                    pitch_diff = abs(rel_pitch - target_pitch)/2.5
 
                     if yaw_diff < self.pose_lock_threshold * 3 and pitch_diff < self.pose_lock_threshold * 3:
                         mimic_success = True
